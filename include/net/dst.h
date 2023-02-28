@@ -16,6 +16,7 @@
 #include <linux/bug.h>
 #include <linux/jiffies.h>
 #include <linux/refcount.h>
+#include <linux/rcuref.h>
 #include <net/neighbour.h>
 #include <asm/processor.h>
 #include <linux/indirect_call_wrapper.h>
@@ -65,7 +66,7 @@ struct dst_entry {
 	 * input/output/ops or performance tanks badly
 	 */
 #ifdef CONFIG_64BIT
-	atomic_t		__refcnt;	/* 64-bit offset 64 */
+	rcuref_t		__refcnt;	/* 64-bit offset 64 */
 #endif
 	int			__use;
 	unsigned long		lastuse;
@@ -75,7 +76,7 @@ struct dst_entry {
 	__u32			tclassid;
 #ifndef CONFIG_64BIT
 	struct lwtunnel_state   *lwtstate;
-	atomic_t		__refcnt;	/* 32-bit offset 64 */
+	rcuref_t		__refcnt;	/* 32-bit offset 64 */
 #endif
 	netdevice_tracker	dev_tracker;
 #ifdef CONFIG_64BIT
@@ -238,7 +239,7 @@ static inline void dst_hold(struct dst_entry *dst)
 	 * the placement of __refcnt in struct dst_entry
 	 */
 	BUILD_BUG_ON(offsetof(struct dst_entry, __refcnt) & 63);
-	WARN_ON(atomic_inc_not_zero(&dst->__refcnt) == 0);
+	WARN_ON(!rcuref_get(&dst->__refcnt));
 }
 
 static inline void dst_use_noref(struct dst_entry *dst, unsigned long time)
@@ -302,7 +303,7 @@ static inline void skb_dst_copy(struct sk_buff *nskb, const struct sk_buff *oskb
  */
 static inline bool dst_hold_safe(struct dst_entry *dst)
 {
-	return atomic_inc_not_zero(&dst->__refcnt);
+	return rcuref_get(&dst->__refcnt);
 }
 
 /**
