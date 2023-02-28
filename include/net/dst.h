@@ -69,15 +69,25 @@ struct dst_entry {
 #endif
 	int			__use;
 	unsigned long		lastuse;
-	struct lwtunnel_state   *lwtstate;
 	struct rcu_head		rcu_head;
 	short			error;
 	short			__pad;
 	__u32			tclassid;
 #ifndef CONFIG_64BIT
+	struct lwtunnel_state   *lwtstate;
 	atomic_t		__refcnt;	/* 32-bit offset 64 */
 #endif
 	netdevice_tracker	dev_tracker;
+#ifdef CONFIG_64BIT
+	/*
+	 * Ensure that lwtstate is not in the same cache line as __refcnt,
+	 * because that would lead to false sharing under high contention
+	 * of __refcnt. This also ensures that rtable::rt_genid is not
+	 * sharing the same cache-line.
+	 */
+	int			pad2[6];
+	struct lwtunnel_state   *lwtstate;
+#endif
 };
 
 struct dst_metrics {
