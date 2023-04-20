@@ -700,6 +700,8 @@ EXPORT_SYMBOL(boot_option_idle_override);
  */
 void __cpuidle default_idle(void)
 {
+	if  (boot_cpu_has(X86_FEATURE_HYPERVISOR))
+		leave_mm(smp_processor_id());
 	raw_safe_halt();
 	raw_local_irq_disable();
 }
@@ -858,6 +860,8 @@ static int prefer_mwait_c1_over_halt(const struct cpuinfo_x86 *c)
  */
 static __cpuidle void mwait_idle(void)
 {
+	if  (boot_cpu_has(X86_FEATURE_HYPERVISOR))
+		leave_mm(smp_processor_id());
 	if (!current_set_polling_and_test()) {
 		if (this_cpu_has(X86_BUG_CLFLUSH_MONITOR)) {
 			mb(); /* quirk */
