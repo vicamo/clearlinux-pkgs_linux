@@ -19,20 +19,43 @@ on:
 jobs:
   apply-patches:
     runs-on: ubuntu-latest
+    env:
+      KORG_STABLE_URL: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux-stable.git
+      CLEARLINUX_URL: https://github.com/clearlinux-pkgs/linux.git
     steps:
       - name: Checkout
         uses: actions/checkout@v3.5.2
+        with:
+          fetch-depth: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && github.ref == 'refs/heads/main' && 1000 || 1 }}
 
-      - name: Apply patches
+      - name: Setup Git
         env:
-          KORG_STABLE_URL: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux-stable.git
           CI_COMMIT_AUTHOR: Continuous Integration
         run: |
-          git branch spec-branch
           git config --global user.name "${{ env.CI_COMMIT_AUTHOR }}"
           git config --global user.email "username@users.noreply.github.com"
 
-          spec="$(git show "spec-branch:linux.spec")"
+      - name: Merge Upstream
+        run: |
+          spec_branch=spec-branch
+          if [ "yes" == ${{ (github.event_name == 'push' || github.event_name == 'schedule') && github.ref == 'refs/heads/main' && 'yes' || 'no' }} ]; then
+            git remote add clearlinux "${CLEARLINUX_URL}";
+            git fetch clearlinux refs/heads/main:refs/remotes/clearlinux/main;
+            ver_current="$(git show "HEAD:linux.spec" | awk '/^Version:/ { kver=$2; } /^Release:/ { release=$2; } END { print kver "-" release; }')";
+            ver_remote="$(git show "clearlinux/main:linux.spec" | awk '/^Version:/ { kver=$2; } /^Release:/ { release=$2; } END { print kver "-" release; }')";
+            if [ "${ver_current}" != "${ver_remote}" ] && [ "$(git describe --tags clearlinux/main)" == "${ver_remote}" ]; then
+              if ! git merge -m "Merge remote-tracking branch 'clearlinux/main'" clearlinux/main; then
+                echo "Skip merging clearlinux/main";
+                git merge --abort;
+              fi;
+            fi;
+          fi
+          git branch "${spec_branch}"
+          echo "spec_branch=${spec_branch}" >> "$GITHUB_ENV"
+
+      - name: Apply patches
+        run: |
+          spec="$(git show "${spec_branch}:linux.spec")"
           kver=$(echo "${spec}" | awk '/^Version:/ { print $2; }')
           echo "kver=${kver}" >> "$GITHUB_ENV"
           release=$(echo "${spec}" | awk '/^Release:/ { print $2; }')
@@ -45,7 +68,7 @@ jobs:
           for patch_id in $(echo "${spec}" | awk '/^%patch/ { print $1; }'); do
             patch_id="Patch${patch_id#%patch}";
             patch="$(echo "${spec}" | awk "/^${patch_id}/ { print \$2; }")";
-            git show "spec-branch:${patch}" | \
+            git show "${spec_branch}:${patch}" | \
                 git am --3way --signoff --committer-date-is-author-date;
           done
           git log --graph --oneline "v${kver}..HEAD"
