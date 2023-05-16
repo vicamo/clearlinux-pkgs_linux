@@ -86,6 +86,7 @@ jobs:
           if ! (git fetch --depth=1 origin "refs/tags/${APPLIED_TAG}" 2>/dev/null); then
             echo "NEED_PUSH=1" >> $GITHUB_ENV;
             echo "Not yet tagged ${APPLIED_TAG}.";
+            git fetch --unshallow korg-stable "refs/tags/v${kver}:refs/tags/v${kver}"
             git tag -l | xargs git tag -d;
             git tag -a -m "Applied ${kver}-${release}" "${APPLIED_TAG}";
           else
