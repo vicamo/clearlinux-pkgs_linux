@@ -84,13 +84,13 @@ jobs:
 
           APPLIED_TAG="${APPLIED_BRANCH}/${kver}-${release}"
           if ! (git fetch --depth=1 origin "refs/tags/${APPLIED_TAG}" 2>/dev/null); then
-            echo "NEED_PUSH=1" >> $GITHUB_ENV;
+            echo "NEED_PUSH_APPLIED=1" >> $GITHUB_ENV;
             echo "Not yet tagged ${APPLIED_TAG}.";
             git fetch --unshallow korg-stable "refs/tags/v${kver}:refs/tags/v${kver}"
             git tag -l | xargs git tag -d;
             git tag -a -m "Applied ${kver}-${release}" "${APPLIED_TAG}";
           else
-            echo "NEED_PUSH=0" >> $GITHUB_ENV;
+            echo "NEED_PUSH_APPLIED=0" >> $GITHUB_ENV;
             echo "Tag ${APPLIED_TAG} already exists.";
             if [ "$(git describe --tags)" != "${APPLIED_TAG}" ]; then
               echo "Warning!!! Doesn't match the published release.";
@@ -98,10 +98,21 @@ jobs:
           fi
 
       - name: Push applied HEAD
-        if: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && github.ref == 'refs/heads/main' && env.NEED_PUSH == '1' }}
+        if: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && github.ref == 'refs/heads/main' && env.NEED_PUSH_APPLIED == '1' }}
         uses: ad-m/github-push-action@master
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           branch: ${{ format('refs/heads/{0}', env.APPLIED_BRANCH) }}
           force: true
           tags: true
+
+      - name: Checkout back to spec-branch HEAD
+        if: ${{ github.event_name == 'schedule' && github.ref == 'refs/heads/main' }}
+        run: git checkout "${spec_branch}"
+
+      - name: Push spec-branch HEAD
+        if: ${{ github.event_name == 'schedule' && github.ref == 'refs/heads/main' }}
+        uses: ad-m/github-push-action@master
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          branch: refs/heads/main
