@@ -51,11 +51,13 @@
 #include <linux/notifier.h>
 #include <linux/cpu.h>
 #include <linux/moduleparam.h>
+#include <linux/units.h>
 #include <asm/cpu_device_id.h>
 #include <asm/intel-family.h>
 #include <asm/nospec-branch.h>
 #include <asm/mwait.h>
 #include <asm/msr.h>
+#include <asm/tsc.h>
 #include <asm/fpu/api.h>
 
 #define INTEL_IDLE_VERSION "0.5.1"
@@ -68,10 +70,13 @@ static struct cpuidle_driver intel_idle_driver = {
 static int max_cstate = CPUIDLE_STATE_MAX - 1;
 static unsigned int disabled_states_mask;
 static unsigned int preferred_states_mask;
+static bool skip_mwait_check;
 
 static struct cpuidle_device __percpu *intel_idle_cpuidle_devices;
 
 static unsigned long auto_demotion_disable_flags;
+
+static u64 umwait_limit;
 
 static enum {
 	C1E_PROMOTION_PRESERVE,
@@ -141,6 +146,14 @@ static __always_inline int __intel_idle(struct cpuidle_device *dev,
 	return index;
 }
 
+static __always_inline int __intel_idle_hlt(struct cpuidle_device *dev,
+					struct cpuidle_driver *drv, int index)
+{
+	raw_safe_halt();
+	raw_local_irq_disable();
+	return index;
+}
+
 /**
  * intel_idle - Ask the processor to enter the given idle state.
  * @dev: cpuidle device of the target CPU.
@@ -172,6 +185,36 @@ static __cpuidle int intel_idle_irq(struct cpuidle_device *dev,
 
 	return ret;
 }
+
+/**
+ * intel_idle_hlt - Ask the processor to enter the given idle state using hlt.
+ * @dev: cpuidle device of the target CPU.
+ * @drv: cpuidle driver (assumed to point to intel_idle_driver).
+ * @index: Target idle state index.
+ *
+ * Use the HLT instruction to notify the processor that the CPU represented by
+ * @dev is idle and it can try to enter the idle state corresponding to @index.
+ *
+ * Must be called under local_irq_disable().
+ */
+static __cpuidle int intel_idle_hlt(struct cpuidle_device *dev,
+				struct cpuidle_driver *drv, int index)
+{
+	return __intel_idle_hlt(dev, drv, index);
+}
+
+static __cpuidle int intel_idle_hlt_irq(struct cpuidle_device *dev,
+                                   struct cpuidle_driver *drv, int index)
+{
+       int ret;
+
+       raw_local_irq_enable();
+       ret = __intel_idle_hlt(dev, drv, index);
+       raw_local_irq_disable();
+
+       return ret;
+}
+
 
 static __cpuidle int intel_idle_ibrs(struct cpuidle_device *dev,
 				     struct cpuidle_driver *drv, int index)
@@ -249,6 +292,27 @@ static __cpuidle int intel_idle_s2idle(struct cpuidle_device *dev,
 	mwait_idle_with_hints(eax, ecx);
 
 	return 0;
+}
+
+/**
+ * intel_idle_umwait_irq - Request C0.x using the 'umwait' instruction.
+ * @dev: cpuidle device of the target CPU.
+ * @drv: cpuidle driver (assumed to point to intel_idle_driver).
+ * @index: Target idle state index.
+ *
+ * Request C0.1 or C0.2 using 'umwait' instruction with interrupts enabled.
+ */
+static __cpuidle int intel_idle_umwait_irq(struct cpuidle_device *dev,
+					   struct cpuidle_driver *drv,
+					   int index)
+{
+	u32 state = flg2MWAIT(drv->states[index].flags);
+
+	raw_local_irq_enable();
+	umwait_idle(rdtsc() + umwait_limit, state);
+	raw_local_irq_disable();
+
+	return index;
 }
 
 /*
@@ -992,6 +1056,13 @@ static struct cpuidle_state adl_n_cstates[] __initdata = {
 		.target_residency = 2,
 		.enter = &intel_idle_umwait, },
 	{
+		.name = "C0.2",
+		.desc = "UMWAIT C0.2",
+		.flags = MWAIT2flg(TPAUSE_C02_STATE) | CPUIDLE_FLAG_IRQ_ENABLE,
+		.exit_latency_ns = 100,
+		.target_residency_ns = 100,
+		.enter = &intel_idle_umwait_irq, },
+	{
 		.name = "C1",
 		.desc = "MWAIT 0x00",
 		.flags = MWAIT2flg(0x00) | CPUIDLE_FLAG_UNUSABLE,
@@ -1323,6 +1394,32 @@ static struct cpuidle_state snr_cstates[] __initdata = {
 		.enter = NULL }
 };
 
+static struct cpuidle_state vmguest_cstates[] __initdata = {
+	{
+		.name = "C0.2",
+		.desc = "UMWAIT C0.2",
+		.flags = MWAIT2flg(TPAUSE_C02_STATE) | CPUIDLE_FLAG_IRQ_ENABLE,
+		.exit_latency_ns = 100,
+		.target_residency_ns = 100,
+		.enter = &intel_idle_umwait_irq, },
+	{
+		.name = "C1",
+		.desc = "HLT",
+		.flags = MWAIT2flg(0x00) | CPUIDLE_FLAG_IRQ_ENABLE,
+		.exit_latency = 5,
+		.target_residency = 10,
+		.enter = &intel_idle_hlt_irq, },
+	{
+		.name = "C1L",
+		.desc = "Long HLT",
+		.flags = MWAIT2flg(0x00) | CPUIDLE_FLAG_TLB_FLUSHED,
+		.exit_latency = 5,
+		.target_residency = 500,
+		.enter = &intel_idle_hlt, },
+	{
+		.enter = NULL }
+};
+
 static const struct idle_cpu idle_cpu_nehalem __initconst = {
 	.state_table = nehalem_cstates,
 	.auto_demotion_disable_flags = NHM_C1_AUTO_DEMOTE | NHM_C3_AUTO_DEMOTE,
@@ -1505,6 +1602,9 @@ static const struct x86_cpu_id intel_idle_ids[] __initconst = {
 	X86_MATCH_INTEL_FAM6_MODEL(ALDERLAKE,		&idle_cpu_adl),
 	X86_MATCH_INTEL_FAM6_MODEL(ALDERLAKE_L,		&idle_cpu_adl_l),
 	X86_MATCH_INTEL_FAM6_MODEL(ALDERLAKE_N,		&idle_cpu_adl_n),
+	X86_MATCH_INTEL_FAM6_MODEL(RAPTORLAKE,		&idle_cpu_adl),
+	X86_MATCH_INTEL_FAM6_MODEL(RAPTORLAKE_P,		&idle_cpu_adl),
+	X86_MATCH_INTEL_FAM6_MODEL(RAPTORLAKE_S,		&idle_cpu_adl),
 	X86_MATCH_INTEL_FAM6_MODEL(SAPPHIRERAPIDS_X,	&idle_cpu_spr),
 	X86_MATCH_INTEL_FAM6_MODEL(EMERALDRAPIDS_X,	&idle_cpu_spr),
 	X86_MATCH_INTEL_FAM6_MODEL(XEON_PHI_KNL,	&idle_cpu_knl),
@@ -1970,13 +2070,14 @@ static void __init intel_idle_init_cstates_icpu(struct cpuidle_driver *drv)
 		}
 
 		mwait_hint = flg2MWAIT(cpuidle_state_table[cstate].flags);
-		if (!intel_idle_verify_cstate(mwait_hint))
+		if (!skip_mwait_check && !intel_idle_verify_cstate(mwait_hint))
 			continue;
 
 		/* Structure copy. */
 		drv->states[drv->state_count] = cpuidle_state_table[cstate];
 
-		if ((cpuidle_state_table[cstate].flags & CPUIDLE_FLAG_IRQ_ENABLE) || force_irq_on) {
+		if ((cpuidle_state_table[cstate].enter == intel_idle &&
+		     cpuidle_state_table[cstate].flags & CPUIDLE_FLAG_IRQ_ENABLE) || force_irq_on) {
 			printk("intel_idle: forced intel_idle_irq for state %d\n", cstate);
 			drv->states[drv->state_count].enter = intel_idle_irq;
 		}
@@ -2009,12 +2110,35 @@ static void __init intel_idle_init_cstates_icpu(struct cpuidle_driver *drv)
 }
 
 /**
+ * umwait_limit_init - initialize time limit value for 'umwait'.
+ *
+ * C0.1 and C0.2 (later C0.x) idle states are requested via the 'umwait'
+ * instruction. The 'umwait' instruction requires the "deadline" - the TSC
+ * counter value to break out of C0.x (unless it broke out because of an
+ * interrupt or some other event).
+ *
+ * The deadline is specified as an absolute TSC value, and it is calculated as
+ * current TSC value + 'umwait_limit'. This function initializes the
+ * 'umwait_limit' variable to count of cycles per tick. The motivation is:
+ *   * the tick is not disabled for shallow states like C0.x so, so idle will
+ *     not last longer than a tick anyway
+ *   * limit idle time to give cpuidle a chance to re-evaluate its C-state
+ *     selection decision and possibly select a deeper C-state.
+ */
+static void __init umwait_limit_init(void)
+{
+	umwait_limit = (u64)TICK_NSEC * tsc_khz;
+	do_div(umwait_limit, MICRO);
+}
+
+/**
  * intel_idle_cpuidle_driver_init - Create the list of available idle states.
  * @drv: cpuidle driver structure to initialize.
  */
 static void __init intel_idle_cpuidle_driver_init(struct cpuidle_driver *drv)
 {
 	cpuidle_poll_state_init(drv);
+	umwait_limit_init();
 
 	if (disabled_states_mask & BIT(0))
 		drv->states[0].flags |= CPUIDLE_FLAG_OFF;
@@ -2114,6 +2238,118 @@ static void __init intel_idle_cpuidle_devices_uninit(void)
 		cpuidle_unregister_device(per_cpu_ptr(intel_idle_cpuidle_devices, i));
 }
 
+/*
+ * Match up the latency and break even point of the bare metal (cpu based)
+ * states with the deepest VM available state. 
+ *
+ * We only want to do this for the deepest state, the ones that has
+ * the TLB_FLUSHED flag set on the .
+ *
+ * All our short idle states are dominated by vmexit/vmenter latencies,
+ * not the underlying hardware latencies so we keep our values for these.
+ */
+static void matchup_vm_state_with_baremetal(void)
+{
+	int cstate;
+
+	for (cstate = 0; cstate < CPUIDLE_STATE_MAX; ++cstate) {
+		int matching_cstate;
+
+		if (intel_idle_max_cstate_reached(cstate))
+			break;
+
+		if (!cpuidle_state_table[cstate].enter &&
+		    !cpuidle_state_table[cstate].enter_s2idle)
+			break;
+
+		if (!(cpuidle_state_table[matching_cstate].flags & CPUIDLE_FLAG_TLB_FLUSHED))
+			continue;
+
+		for (matching_cstate = 0; matching_cstate < CPUIDLE_STATE_MAX; ++matching_cstate) {
+			if (icpu->state_table[matching_cstate].exit_latency > cpuidle_state_table[cstate].exit_latency) {
+				cpuidle_state_table[cstate].exit_latency = icpu->state_table[matching_cstate].exit_latency;
+				cpuidle_state_table[cstate].target_residency = icpu->state_table[matching_cstate].target_residency;
+			}
+		}
+
+	}
+}
+
+/*
+ * If umwait is not available (either not supported by the CPU or marked by
+ * the hypervisor) we need to disable the C0.x states from our table
+ */
+static void mask_out_umwait(void)
+{
+	int cstate;
+
+	if (boot_cpu_has(X86_FEATURE_WAITPKG))
+		return;
+
+	for (cstate = 0; cstate < CPUIDLE_STATE_MAX; ++cstate) {
+		if (intel_idle_max_cstate_reached(cstate))
+			break;
+
+		if (!cpuidle_state_table[cstate].enter &&
+		    !cpuidle_state_table[cstate].enter_s2idle)
+			break;
+
+		if (cpuidle_state_table[cstate].enter == intel_idle_umwait_irq)
+			cpuidle_state_table[cstate].flags |= CPUIDLE_FLAG_UNUSABLE;
+	}
+}
+
+static int __init intel_idle_vminit(const struct x86_cpu_id *id)
+{
+	int retval;
+
+
+	cpuidle_state_table = vmguest_cstates;
+	skip_mwait_check = true; /* hypervisor hides mwait from us normally */
+
+	icpu = (const struct idle_cpu *)id->driver_data;
+	intel_idle_cpuidle_devices = alloc_percpu(struct cpuidle_device);
+	if (!intel_idle_cpuidle_devices)
+		return -ENOMEM;
+
+	/*
+	 * We don't know exactly what the host will do when we go idle, but as a worst estimate
+	 * we can assume that the exit latency of the deepest host state will be hit for our
+	 * deep (long duration) guest idle state.
+	 * The same logic applies to the break even point for the long duration guest idle state.
+	 * So lets copy these two properties from the table we found for the host CPU type.
+	 */
+	matchup_vm_state_with_baremetal();
+	/*
+	 * Not every VMM/CPU combination supports umwait; mark the C0.x states unsable if so.
+	 */
+	mask_out_umwait();
+
+
+	intel_idle_cpuidle_driver_init(&intel_idle_driver);
+
+	retval = cpuidle_register_driver(&intel_idle_driver);
+	if (retval) {
+		struct cpuidle_driver *drv = cpuidle_get_driver();
+		printk(KERN_DEBUG pr_fmt("intel_idle yielding to %s\n"),
+		       drv ? drv->name : "none");
+		goto init_driver_fail;
+	}
+
+	retval = cpuhp_setup_state(CPUHP_AP_ONLINE_DYN, "idle/intel:online",
+				   intel_idle_cpu_online, NULL);
+	if (retval < 0)
+		goto hp_setup_fail;
+
+	return 0;
+hp_setup_fail:
+	intel_idle_cpuidle_devices_uninit();
+	cpuidle_unregister_driver(&intel_idle_driver);
+init_driver_fail:
+	free_percpu(intel_idle_cpuidle_devices);
+	return retval;
+}
+
 static int __init intel_idle_init(void)
 {
 	const struct x86_cpu_id *id;
@@ -2132,6 +2368,8 @@ static int __init intel_idle_init(void)
 	id = x86_match_cpu(intel_idle_ids);
 	if (id) {
 		if (!boot_cpu_has(X86_FEATURE_MWAIT)) {
+			if (boot_cpu_has(X86_FEATURE_HYPERVISOR))
+				return intel_idle_vminit(id);
 			pr_debug("Please enable MWAIT in BIOS SETUP\n");
 			return -ENODEV;
 		}
