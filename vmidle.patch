@@ -1,5 +1,16 @@
---- a/drivers/idle/intel_idle.c.org	2023-05-18 21:44:16.085921498 +0000
-+++ b/drivers/idle/intel_idle.c	2023-05-19 00:05:22.789398088 +0000
+From 875eb1fb8991d2292b8624eb38f65396403412c5 Mon Sep 17 00:00:00 2001
+From: Arjan van de Ven <arjan@linux.intel.com>
+Date: Thu, 25 May 2023 17:42:26 +0000
+Subject: [PATCH] support intel_idle inside VM guests
+
+---
+ drivers/idle/intel_idle.c | 242 +++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 240 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/idle/intel_idle.c b/drivers/idle/intel_idle.c
+index 4c0eb724303ad..70bf96ab8c95e 100644
+--- a/drivers/idle/intel_idle.c
++++ b/drivers/idle/intel_idle.c
 @@ -51,11 +51,13 @@
  #include <linux/notifier.h>
  #include <linux/cpu.h>
@@ -14,7 +25,7 @@
  #include <asm/fpu/api.h>
  
  #define INTEL_IDLE_VERSION "0.5.1"
-@@ -68,11 +70,14 @@
+@@ -68,11 +70,14 @@ static struct cpuidle_driver intel_idle_driver = {
  static int max_cstate = CPUIDLE_STATE_MAX - 1;
  static unsigned int disabled_states_mask;
  static unsigned int preferred_states_mask;
@@ -29,7 +40,7 @@
  static enum {
  	C1E_PROMOTION_PRESERVE,
  	C1E_PROMOTION_ENABLE,
-@@ -141,6 +146,14 @@
+@@ -141,6 +146,14 @@ static __always_inline int __intel_idle(struct cpuidle_device *dev,
  	return index;
  }
  
@@ -44,7 +55,7 @@
  /**
   * intel_idle - Ask the processor to enter the given idle state.
   * @dev: cpuidle device of the target CPU.
-@@ -173,6 +186,36 @@
+@@ -173,6 +186,36 @@ static __cpuidle int intel_idle_irq(struct cpuidle_device *dev,
  	return ret;
  }
  
@@ -81,7 +92,7 @@
  static __cpuidle int intel_idle_ibrs(struct cpuidle_device *dev,
  				     struct cpuidle_driver *drv, int index)
  {
-@@ -225,6 +268,27 @@
+@@ -251,6 +294,27 @@ static __cpuidle int intel_idle_s2idle(struct cpuidle_device *dev,
  	return 0;
  }
  
@@ -109,21 +120,21 @@
  /*
   * States are indexed by the cstate number,
   * which is also the index into the MWAIT hint array.
-@@ -969,6 +1033,13 @@
- 
- static struct cpuidle_state spr_cstates[] __initdata = {
- 	{
+@@ -991,6 +1055,13 @@ static struct cpuidle_state adl_n_cstates[] __initdata = {
+ 		.exit_latency = 1,
+ 		.target_residency = 2,
+ 		.enter = &intel_idle_umwait, },
++	{
 +		.name = "C0.2",
 +		.desc = "UMWAIT C0.2",
 +		.flags = MWAIT2flg(TPAUSE_C02_STATE) | CPUIDLE_FLAG_IRQ_ENABLE,
 +		.exit_latency_ns = 100,
 +		.target_residency_ns = 100,
 +		.enter = &intel_idle_umwait_irq, },
-+	{
+ 	{
  		.name = "C1",
  		.desc = "MWAIT 0x00",
- 		.flags = MWAIT2flg(0x00),
-@@ -1241,6 +1312,32 @@
+@@ -1323,6 +1394,32 @@ static struct cpuidle_state snr_cstates[] __initdata = {
  		.enter = NULL }
  };
  
@@ -156,7 +167,7 @@
  static const struct idle_cpu idle_cpu_nehalem __initconst = {
  	.state_table = nehalem_cstates,
  	.auto_demotion_disable_flags = NHM_C1_AUTO_DEMOTE | NHM_C3_AUTO_DEMOTE,
-@@ -1423,6 +1520,9 @@
+@@ -1505,6 +1602,9 @@ static const struct x86_cpu_id intel_idle_ids[] __initconst = {
  	X86_MATCH_INTEL_FAM6_MODEL(ALDERLAKE,		&idle_cpu_adl),
  	X86_MATCH_INTEL_FAM6_MODEL(ALDERLAKE_L,		&idle_cpu_adl_l),
  	X86_MATCH_INTEL_FAM6_MODEL(ALDERLAKE_N,		&idle_cpu_adl_n),
@@ -166,7 +177,7 @@
  	X86_MATCH_INTEL_FAM6_MODEL(SAPPHIRERAPIDS_X,	&idle_cpu_spr),
  	X86_MATCH_INTEL_FAM6_MODEL(EMERALDRAPIDS_X,	&idle_cpu_spr),
  	X86_MATCH_INTEL_FAM6_MODEL(XEON_PHI_KNL,	&idle_cpu_knl),
-@@ -1888,13 +1988,14 @@
+@@ -1970,13 +2070,14 @@ static void __init intel_idle_init_cstates_icpu(struct cpuidle_driver *drv)
  		}
  
  		mwait_hint = flg2MWAIT(cpuidle_state_table[cstate].flags);
@@ -183,10 +194,11 @@
  			printk("intel_idle: forced intel_idle_irq for state %d\n", cstate);
  			drv->states[drv->state_count].enter = intel_idle_irq;
  		}
-@@ -1927,12 +2028,35 @@
+@@ -2008,6 +2109,28 @@ static void __init intel_idle_init_cstates_icpu(struct cpuidle_driver *drv)
+ 	}
  }
  
- /**
++/**
 + * umwait_limit_init - initialize time limit value for 'umwait'.
 + *
 + * C0.1 and C0.2 (later C0.x) idle states are requested via the 'umwait'
@@ -208,10 +220,10 @@
 +	do_div(umwait_limit, MICRO);
 +}
 +
-+/**
+ /**
   * intel_idle_cpuidle_driver_init - Create the list of available idle states.
   * @drv: cpuidle driver structure to initialize.
-  */
+@@ -2015,6 +2138,7 @@ static void __init intel_idle_init_cstates_icpu(struct cpuidle_driver *drv)
  static void __init intel_idle_cpuidle_driver_init(struct cpuidle_driver *drv)
  {
  	cpuidle_poll_state_init(drv);
@@ -219,7 +231,7 @@
  
  	if (disabled_states_mask & BIT(0))
  		drv->states[0].flags |= CPUIDLE_FLAG_OFF;
-@@ -2032,6 +2156,118 @@
+@@ -2114,6 +2238,118 @@ static void __init intel_idle_cpuidle_devices_uninit(void)
  		cpuidle_unregister_device(per_cpu_ptr(intel_idle_cpuidle_devices, i));
  }
  
@@ -338,7 +350,7 @@
  static int __init intel_idle_init(void)
  {
  	const struct x86_cpu_id *id;
-@@ -2050,6 +2286,8 @@
+@@ -2132,6 +2368,8 @@ static int __init intel_idle_init(void)
  	id = x86_match_cpu(intel_idle_ids);
  	if (id) {
  		if (!boot_cpu_has(X86_FEATURE_MWAIT)) {
@@ -347,3 +359,6 @@
  			pr_debug("Please enable MWAIT in BIOS SETUP\n");
  			return -ENODEV;
  		}
+-- 
+2.40.1
+
