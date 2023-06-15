@@ -5,13 +5,13 @@
 #
 
 Name:           linux
-Version:        6.3.3
-Release:        1313
+Version:        6.3.4
+Release:        1315
 License:        GPL-2.0
 Summary:        The Linux kernel
 Url:            http://www.kernel.org/
 Group:          kernel
-Source0:        https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.3.3.tar.xz
+Source0:        https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.3.4.tar.xz
 Source1:        config
 Source2:        cmdline
 
@@ -33,7 +33,6 @@ Requires: linux-license = %{version}-%{release}
 #cve.end
 
 #mainline: Mainline patches, upstream backport and fixes from 0051 to 0099
-Patch0051: 0051-block-bfq-Fix-division-by-zero-error-on-zero-wsum.patch
 #mainline.end
 
 #Serie.clr 01XX: Clear Linux patches
@@ -141,13 +140,12 @@ Requires:       linux-license = %{version}-%{release}
 Linux kernel build files
 
 %prep
-%setup -q -n linux-6.3.3
+%setup -q -n linux-6.3.4
 
 #cve.patch.start cve patches
 #cve.patch.end
 
 #mainline.patch.start Mainline patches, upstream backport and fixes
-%patch0051 -p1
 #mainline.patch.end
 
 #Serie.patch.start Clear Linux patches
